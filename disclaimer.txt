@@ -1,0 +1,17 @@
+Helia
+Purpose:
+
+Helia is an educational open-source project aimed at facilitating learning and collaboration in the field of large language models (LLMs). It serves as a platform for developers to contribute to and learn from, with a focus on exploring LLMs and their applications.
+
+Acknowledgments:
+
+Parts of Helia are derived from other AI models, including Meta's Llama3 AI. Specifically, the tokenizer and generation scripts used in Helia are based on the original scripts developed by Meta. These scripts remain the property of Meta, and we acknowledge their contributions to the broader AI community.
+
+GPT-4o:
+
+During the development of Helia, the GPT-4o model was used as a code correction tool. It aided in refining the implementation of various components of Helia and improving code quality.
+
+Disclaimer:
+
+While Helia incorporates elements from other AI models, we do not claim ownership of these components. They remain the property of their respective developers, and we express our gratitude for their contributions to the field of AI.
+

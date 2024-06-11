@@ -1,0 +1,2 @@
+pip install torch torchvision onnx onnx-tf tensorflow
+pip install nbimporter
