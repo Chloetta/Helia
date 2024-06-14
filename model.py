@@ -1,27 +1,10 @@
 import math
-from typing import Optional, Tuple
+from typing import Optional
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import nbimporter
-from llama.model import Transformer  # Import Transformer class from llama.model
-from llama.tokenizer import Tokenizer  # Import Tokenizer class from llama.tokenizer
-import requests
-from bs4 import BeautifulSoup
-import time
-import json
 from dataclasses import dataclass
-from fairscale.nn.model_parallel.layers import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-    VocabParallelEmbedding,
-)
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# Load Torch Module via Jupyter notebook
-TensorTorch = nbimporter.import_notebook('Torch.ipynb')
-from TensorTorch import LinearLayer, MultiHeadAttention, FeedForward
-
-# Defined Parameters using dataclass
 @dataclass
 class ModelArgs:
     dim: int = 4096
@@ -36,95 +19,155 @@ class ModelArgs:
     max_batch_size: int = 32
     max_seq_len: int = 2048
 
-# Define a simple GELU activation function
 def gelu(x):
     return 0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
 
-# Define a simple attention mask function
 def attention_mask(nd, ns, dtype=torch.float32):
     i = torch.arange(nd)[:, None]
     j = torch.arange(ns)
     m = i >= j - ns + nd
     return m.to(dtype)
 
-# Define single multi-headed block
+class Attention(nn.Module):
+    def __init__(self, dim, n_heads):
+        super().__init__()
+        self.dim = dim
+        self.n_heads = n_heads
+        self.query_linear = nn.Linear(dim, dim)
+        self.key_linear = nn.Linear(dim, dim)
+        self.value_linear = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, x, mask):
+        query = self.query_linear(x)
+        key = self.key_linear(x)
+        value = self.value_linear(x)
+        attention = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.dim)
+        if mask is not None:
+            attention = attention + mask
+        attention = torch.softmax(attention, dim=-1)
+        attention = self.dropout(attention)
+        output = torch.matmul(attention, value)
+        return output
+
+class FeedForward(nn.Module):
+    def __init__(self, dim, hidden_dim):
+        super().__init__()
+        self.linear1 = nn.Linear(dim, hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, dim)
+        self.gelu = nn.GELU()
+
+    def forward(self, x):
+        x = self.linear1(x)
+        x = self.gelu(x)
+        x = self.linear2(x)
+        return x
+
 class AttentionBlock(nn.Module):
     def __init__(self, model_args: ModelArgs):
         super(AttentionBlock, self).__init__()
         self.model_args = model_args
-        self.multi_head_attn = MultiHeadAttention(model_args.dim, model_args.n_heads)
+        self.multi_head_attn = Attention(model_args.dim, model_args.n_heads)
         self.ffn = FeedForward(model_args.dim, model_args.dim * 4)
 
     def forward(self, x, mask):
-        attn_output = self.multi_head_attn(x, x, x, mask)
+        attn_output = self.multi_head_attn(x, mask)
         ffn_output = self.ffn(attn_output)
         return ffn_output
 
-# Example usage
-if __name__ == "__main__":
-    args = ModelArgs(vocab_size=50257)
-    # Example tensor input
-    x = torch.rand((args.max_batch_size, args.max_seq_len, args.dim))
-    mask = attention_mask(args.max_seq_len, args.max_seq_len)
+class Transformer(nn.Module):
+    def __init__(self, params: ModelArgs):
+        super().__init__()
+        self.params = params
+        self.vocab_size = params.vocab_size
+        self.n_layers = params.n_layers
 
-    # Initialize and run attention block
-    attn_block = AttentionBlock(args)
-    output = attn_block(x, mask)
-    print(output.shape)
+        self.tok_embeddings = VocabParallelEmbedding(
+            params.vocab_size, params.dim, init_method=lambda x: x
+        )
 
-class Embeddings(nn.Module):
-    def __init__(self, vocab_size, dim):
-        super(Embeddings, self).__init__()
-        self.token_embeddings = nn.Embedding(vocab_size, dim)
-        self.position_embeddings = nn.Embedding(5000, dim)  # assuming max sequence length of 5000
+        self.layers = torch.nn.ModuleList()
+        for layer_id in range(params.n_layers):
+            self.layers.append(TransformerBlock(layer_id, params))
+
+        self.norm = RMSNorm(params.dim, eps=params.norm_eps)
+        self.output = ColumnParallelLinear(
+            params.dim, params.vocab_size, bias=False, init_method=lambda x: x
+        )
+
+        self.freqs_cis = precompute_freqs_cis(
+            params.dim // params.n_heads,
+            params.max_seq_len * 2,
+            params.rope_theta,
+        )
+
+    @torch.inference_mode()
+    def forward(self, tokens: torch.Tensor, start_pos: int):
+        _bsz, seqlen = tokens.shape
+        h = self.tok_embeddings(tokens)
+        self.freqs_cis = self.freqs_cis.to(h.device)
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+
+        mask = None
+        if seqlen > 1:
+            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
+            mask = torch.triu(mask, diagonal=1)
+            mask = torch.hstack(
+                [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
+            ).type_as(h)
+
+        for layer in self.layers:
+            h = layer(h, start_pos, freqs_cis, mask)
+        h = self.norm(h)
+        output = self.output(h).float()
+        return output
+
+class VocabParallelEmbedding(nn.Module):
+    def __init__(self, vocab_size, dim, init_method):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, dim)
+        self.init_method = init_method
 
     def forward(self, x):
-        positions = torch.arange(0, x.size(1)).unsqueeze(0).to(x.device)
-        return self.token_embeddings(x) + self.position_embeddings(positions)
+        return self.embedding(x)
 
-class TransformerModel(nn.Module):
-    def __init__(self, model_args: ModelArgs):
-        super(TransformerModel, self).__init__()
-        self.embeddings = Embeddings(model_args.vocab_size, model_args.dim)
-        self.blocks = nn.ModuleList([AttentionBlock(model_args) for _ in range(model_args.n_layers)])
-        self.norm = nn.LayerNorm(model_args.dim, eps=model_args.norm_eps)
-        self.output_layer = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
 
-    def forward(self, x, mask):
-        x = self.embeddings(x)
-        for block in self.blocks:
-            x = block(x, mask)
-        x = self.norm(x)
-        return self.output_layer(x)
+    def forward(self, x):
+        return x / (x.norm(dim=-1, keepdim=True) + self.eps)
 
-def train_model(model, dataloader, optimizer, criterion, device):
-    model.train()
-    for batch in dataloader:
-        optimizer.zero_grad()
-        input_ids, labels = batch
-        input_ids, labels = input_ids.to(device), labels.to(device)
-        mask = attention_mask(input_ids.size(1), input_ids.size(1)).to(device)
-        outputs = model(input_ids, mask)
-        loss = criterion(outputs.view(-1, outputs.size(-1)), labels.view(-1))
-        loss.backward()
-        optimizer.step()
+class ColumnParallelLinear(nn.Module):
+    def __init__(self, dim, vocab_size, bias=False):
+        super().__init__()
+        self.linear = nn.Linear(dim, vocab_size, bias=bias)
 
-def evaluate_model(model, dataloader, criterion, device):
-    model.eval()
-    total_loss = 0
-    with torch.no_grad():
-        for batch in dataloader:
-            input_ids, labels = batch
-            input_ids, labels = input_ids.to(device), labels.to(device)
-            mask = attention_mask(input_ids.size(1), input_ids.size(1)).to(device)
-            outputs = model(input_ids, mask)
-            loss = criterion(outputs.view(-1, outputs.size(-1)), labels.view(-1))
-            total_loss += loss.item()
-    return total_loss / len(dataloader)
+    def forward(self, x):
+        return self.linear(x)
 
-def save_model(model, path):
-    torch.save(model.state_dict(), path)
+def precompute_freqs_cis(dim, max_seq_len, rope_theta):
+    freqs_cis = torch.zeros((max_seq_len, dim))
+    for i in range(max_seq_len):
+        freqs_cis[i] = torch.arange(i, i + dim) / (rope_theta * math.sqrt(dim))
+    return freqs_cis
 
-def load_model(model, path):
-    model.load_state_dict(torch.load(path))
-    model.eval()
+class TransformerBlock(nn.Module):
+    def __init__(self, layer_id, args):
+        super().__init__()
+        self.args = args
+        self.ln1 = nn.LayerNorm(args.dim, eps=args.norm_eps)
+        self.attn = Attention(args.dim, args.n_heads)
+        self.ln2 = nn.LayerNorm(args.dim, eps=args.norm_eps)
+        self.ffn = FeedForward(args.dim, args.dim * 4)
+
+    def forward(self, x, start_pos, freqs_cis, mask):
+        h = self.ln1(x)
+        attn_output = self.attn(h, mask)
+        h = x + attn_output
+        h = self.ln2(h)
+        ffn_output = self.ffn(h)
+        output = x + ffn_output
+        return output
